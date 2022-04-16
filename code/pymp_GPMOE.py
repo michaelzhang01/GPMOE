@@ -12,7 +12,6 @@ from scipy.special import logsumexp
 from scipy.stats import norm
 from utils import _unscaled_dist, pad_kernel_matrix
 import numpy as np
-# import autograd.numpy as np 
 import pdb
 import pymp
 
@@ -20,6 +19,25 @@ class ParticleGPMOE(object):
 
     def __init__(self, rng, num_threads, X, Y, J, alpha, X_mean, prior_obs, 
                  nu, psi, alpha_a, alpha_b, mb_size):
+        """
+        Initialize the GP-MOE object.
+        Parameters:
+            rng: Numpy RandomState object, used to set random seed
+            num_threads: int, number of cores to use for OpenMP process
+            X: 1 x D numpy array, initial input data
+            Y: 1 x 1 numpy array, initial output data
+            J: int, number of particles to use
+            alpha: positive float, initial concentration parameter value
+            X_mean: 1 x D numpy array, prior mean of X
+            prior_obs: positive int, prior number of observations for Normal-I.W. mixture
+            nu: positive int > D - 1, prior degrees of freedom for I.W. distribution
+            psi: D x D positive definite numpy array, prior covariance matrix for I.W. distribution
+            alpha_a: positive float, prior shape of alpha
+            alpha_b: positive float, prior scale of alpha
+            mb_size: positive int, minibatch size; set to None to not use minibatching
+        """
+
+
         # global settings
         self.rng = rng
         self.num_threads = num_threads
@@ -72,7 +90,7 @@ class ParticleGPMOE(object):
         
     def model_init(self,j):
         """
-        Initializes GPy objects and optimizes hyperparameters
+        Initializes GPbase objects and optimizes hyperparameters
         Parameters:
             j: int, index for particle j
         """
@@ -106,6 +124,12 @@ class ParticleGPMOE(object):
         return(marg_LL)
 
     def particle_update(self, X_star, Y_star):
+        """
+        Update the GP-MOE object with a new observation.
+        Parameters:
+            X: 1 x D numpy array, new input data
+            Y: 1 x 1 numpy array, new output data
+        """
         self.X_star = X_star
         self.X_star.shape[1] == self.D
         self.Y_star = Y_star
@@ -153,18 +177,11 @@ class ParticleGPMOE(object):
                 Z, log_norm = self.crp_predict(j)
                 out[j] = self.gp_update(j, Z, log_norm)
         return(out)
-                
+
     def crp_predict(self, j):
         """
         Assigns new data sequentially to according to CRP and multivariate-t
         marginal likelihood
-        Parameters:
-            X_star: N_star x D numpy array, data to assign to clusters
-            X: N x D numpy array, old data already assigned to clusters
-            Z: N x 1 numpy array, cluster indicators for data in X
-            Z_count: K x 1 numpy array, counts of cluster indicators
-            restrict: bool, if False, allow data to join new clusters. Must
-                      be set to True for prediction tasks.
         """
         Z_count = self.Z_count[j][self.Z_count[j].nonzero()]
         Z = np.copy(self.Z[j])
@@ -216,7 +233,7 @@ class ParticleGPMOE(object):
         kernel_j = dict(self.kernels[j])
         kernel_j[k] = kernel_j_k
         return(Z, log_norm, model_j, new_gp_marg_j, kernel_j)
-    
+
     def posterior_mvn_t(self,X_k,X_star_i):
         """
         Calculates the multivariate-t distributed marginal likelihood of a
@@ -272,7 +289,12 @@ class ParticleGPMOE(object):
         gamma2 = self.rng.gamma(a - 1, 1./ b) 
         return(pi * gamma1 + (1 - pi) * gamma2)
 
-    def predict(self, X_star, Y_star=None):        
+    def predict(self, X_star):     
+        """
+        Predict at test point X_star.
+        Parameters:
+            X_star: N_star x D numpy array, test data
+        """
         pred_j = pymp.shared.dict()
         with pymp.Parallel(self.num_threads) as p:
             for j in p.range(self.J):        
@@ -283,7 +305,6 @@ class ParticleGPMOE(object):
         var = self.W.dot(var)
         return(mean,var)
                       
-
     def predict_j(self, j, X_star):
         N_star, _ = X_star.shape
         nnz       = self.Z_count[j].nonzero()
@@ -335,4 +356,45 @@ class ParticleGPMOE(object):
         return(pred_mean, pred_var)
 
 if __name__ == '__main__':
-    pass
+    from   numpy.random import RandomState
+    import time
+    rng  = RandomState(0)
+    motorcycle = np.loadtxt("../data/motorcycle.txt")
+    motorcycle[:,0] -= motorcycle[:,0].mean()
+    motorcycle[:,0] /= np.sqrt(motorcycle[:,0].var())
+    motorcycle[:,1] -= motorcycle[:,1].mean()
+    motorcycle[:,1] /= np.sqrt(motorcycle[:,1].var())
+    X = motorcycle[:,0][:,None]
+    Y = motorcycle[:,1][:,None]
+    Y -= Y.mean()
+    Y /= Y.std()
+    N = Y.size
+    X = np.linspace(-1,1,N)[:,None]
+    X -= X.mean()
+    X /= X.std()
+    gpmoe  = ParticleGPMOE(rng=rng,
+                           num_threads=16,
+                           X=X[0,None],
+                           Y=Y[0,None],
+                           J=100,
+                           alpha=1, 
+                           X_mean=np.zeros(1), 
+                           prior_obs=1, 
+                           nu=3, 
+                           psi=.5*np.eye(1),
+                           alpha_a=10,
+                           alpha_b=1,
+                           mb_size=1)
+
+    pred_m = np.empty((0,1))
+    pred_v = np.empty((0,1))
+
+    for i in range(1,N,1):
+        m, v = gpmoe.predict(X[i,None])
+        pred_m = np.vstack((pred_m,m))
+        pred_v = np.vstack((pred_v,v))
+        start=time.time()
+        gpmoe.particle_update(X[i,None], Y[i,None])
+        end_time=time.time()-start
+        MSE = np.mean((m - Y[i])**2)
+        print("Obs: %i\tPredict Time: %.2f\tMSE: %.2f" % (i, end_time, MSE))
